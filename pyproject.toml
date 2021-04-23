@@ -57,6 +57,7 @@ multihash = {version = "*", optional = true}
 pynamodb = {version = "*", optional = true}
 smart-open = {version = "*", extras = ["s3"], optional = true}
 strict-rfc3339 = {optional = true, version = "*"}
+pystac = {version = "*", extras = ["validation"], optional = true}
 
 [tool.poetry.dev-dependencies]
 black = "*"
@@ -125,6 +126,9 @@ import_dataset = [
     "jsonschema",
     "pynamodb",
     "smart-open"
+]
+import_metadata_file = [
+    "pystac"
 ]
 import_status = [
     "boto3",

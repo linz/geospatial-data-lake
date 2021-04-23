@@ -1,22 +1,25 @@
 from functools import lru_cache
 from json import JSONDecodeError, dumps, load
 from os.path import dirname
-from typing import Any, Callable, Dict, List, Tuple, Type, Union
+from typing import Any, Callable, List, Tuple
+from urllib.parse import urlparse
 
+import boto3
 from botocore.exceptions import ClientError  # type: ignore[import]
 from botocore.response import StreamingBody  # type: ignore[import]
-from jsonschema import ValidationError  # type: ignore[import]
+from pystac import STAC_IO  # type: ignore[import]
+from pystac.validation import (  # type: ignore[import]
+    STACValidationError,
+    set_validator,
+    validate_all,
+)
 
 from ..check import Check
 from ..log import set_up_logging
 from ..processing_assets_model import ProcessingAssetType, processing_assets_model_with_meta
 from ..types import JsonObject
 from ..validation_results_model import ValidationResult, ValidationResultFactory
-from .stac_validators import (
-    STACCatalogSchemaValidator,
-    STACCollectionSchemaValidator,
-    STACItemSchemaValidator,
-)
+from .stac_validators import DataLakeSTACValidator
 
 LOGGER = set_up_logging(__name__)
 
@@ -24,20 +27,22 @@ STAC_COLLECTION_TYPE = "Collection"
 STAC_ITEM_TYPE = "Feature"
 STAC_CATALOG_TYPE = "Catalog"
 
-STAC_TYPE_VALIDATION_MAP: Dict[
-    str,
-    Union[
-        Type[STACCatalogSchemaValidator],
-        Type[STACCollectionSchemaValidator],
-        Type[STACItemSchemaValidator],
-    ],
-] = {
-    STAC_COLLECTION_TYPE: STACCollectionSchemaValidator,
-    STAC_CATALOG_TYPE: STACCatalogSchemaValidator,
-    STAC_ITEM_TYPE: STACItemSchemaValidator,
-}
 
 S3_URL_PREFIX = "s3://"
+S3_CLIENT = boto3.client("s3")
+
+
+def s3_read_method(url: str) -> StreamingBody:
+    # pylint: disable=no-else-return
+
+    parse_result = urlparse(url, allow_fragments=False)
+    if parse_result.scheme == "s3":
+        bucket_name = parse_result.netloc
+        key = parse_result.path[1:]
+        response = S3_CLIENT.get_object(Bucket=bucket_name, Key=key)
+        return response["Body"].read().decode("utf-8")
+    else:
+        return STAC_IO.default_read_text_method(url)
 
 
 @lru_cache
@@ -57,11 +62,11 @@ class STACDatasetValidator:
         self.url_reader = url_reader
         self.validation_result_factory = validation_result_factory
 
-        self.traversed_urls: List[str] = []
-        self.dataset_assets: List[Dict[str, str]] = []
-        self.dataset_metadata: List[Dict[str, str]] = []
-
         self.processing_assets_model = processing_assets_model_with_meta()
+        self.datalake_validator = DataLakeSTACValidator(validation_result_factory)
+
+        STAC_IO.read_text_method = s3_read_method
+        set_validator(self.datalake_validator)
 
     def run(self, metadata_url: str, hash_key: str) -> None:
         if metadata_url[:5] != S3_URL_PREFIX:
@@ -77,18 +82,18 @@ class STACDatasetValidator:
 
         try:
             self.validate(metadata_url)
-        except (ValidationError, ClientError, JSONDecodeError) as error:
+        except (STACValidationError, ClientError, JSONDecodeError) as error:
             LOGGER.error(dumps({"success": False, "message": str(error)}))
             return
 
-        for index, metadata_file in enumerate(self.dataset_metadata):
+        for index, metadata_file in enumerate(self.datalake_validator.dataset_metadata):
             self.processing_assets_model(
                 hash_key=hash_key,
                 range_key=f"{ProcessingAssetType.METADATA.value}#{index}",
                 url=metadata_file["url"],
             ).save()
 
-        for index, asset in enumerate(self.dataset_assets):
+        for index, asset in enumerate(self.datalake_validator.dataset_assets):
             self.processing_assets_model(
                 hash_key=hash_key,
                 range_key=f"{ProcessingAssetType.DATA.value}#{index}",
@@ -97,15 +102,11 @@ class STACDatasetValidator:
             ).save()
 
     def validate(self, url: str) -> None:  # pylint: disable=too-complex
-        self.traversed_urls.append(url)
         object_json = self.get_object(url)
 
-        stac_type = object_json["type"]
-        validator = STAC_TYPE_VALIDATION_MAP[stac_type]()
-
         try:
-            validator.validate(object_json)
-        except ValidationError as error:
+            validate_all(object_json, url)
+        except STACValidationError as error:
             self.validation_result_factory.save(
                 url,
                 Check.JSON_SCHEMA,
@@ -113,21 +114,6 @@ class STACDatasetValidator:
                 details={"message": str(error)},
             )
             raise
-        self.validation_result_factory.save(url, Check.JSON_SCHEMA, ValidationResult.PASSED)
-        self.dataset_metadata.append({"url": url})
-
-        for asset in object_json.get("assets", {}).values():
-            asset_url = maybe_convert_relative_url_to_absolute(asset["href"], url)
-
-            asset_dict = {"url": asset_url, "multihash": asset["file:checksum"]}
-            LOGGER.debug(dumps({"asset": asset_dict}))
-            self.dataset_assets.append(asset_dict)
-
-        for link_object in object_json["links"]:
-            next_url = maybe_convert_relative_url_to_absolute(link_object["href"], url)
-
-            if next_url not in self.traversed_urls:
-                self.validate(next_url)
 
     def get_object(self, url: str) -> JsonObject:
         try:
